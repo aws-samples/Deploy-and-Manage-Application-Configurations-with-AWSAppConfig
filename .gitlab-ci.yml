@@ -1,0 +1,172 @@
+stages:
+  - update-app-config
+  - deploy-app-config
+
+update-app-config:
+  stage: update-app-config
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint:
+      - '/usr/bin/env'
+  script:
+    - |
+      # Get list of all tenant
+      TENANTS=$(find tenants -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+      
+      for TENANT in $TENANTS; do
+        echo "Processing tenant: $TENANT"
+        
+        # Create/Get Application for tenant
+        APP_ID=$(aws appconfig list-applications --query "Items[?Name=='$TENANT'].Id" --output text)
+        if [ -z "$APP_ID" ]; then
+          echo "Creating application for tenant '$TENANT'..."
+          APP_ID=$(aws appconfig create-application --name $TENANT --query Id --output text)
+        fi
+        
+        # Process each configuration type
+        for CONFIG_TYPE in AllowList FeatureFlags ThrottlingLimits; do
+          echo "Processing config type: $CONFIG_TYPE"
+          
+          # Create/Get Configuration Profile
+          PROFILE_ID=$(aws appconfig list-configuration-profiles --application-id "$APP_ID" --query "Items[?Name=='$CONFIG_TYPE'].Id" --output text)
+          if [ -z "$PROFILE_ID" ]; then
+            echo "Creating configuration profile '$CONFIG_TYPE' for tenant '$TENANT'..."
+            PROFILE_ID=$(aws appconfig create-configuration-profile --application-id "$APP_ID" --name "$CONFIG_TYPE" --description "Configuration profile for $CONFIG_TYPE" --location-uri hosted --query Id --output text)
+          fi
+          
+          # Process each environment
+          for ENV in dev qa; do
+            echo "Processing environment: $ENV"
+            
+            # Priority: Use tenant-specific config if it exists, otherwise use template
+            if [ -f "tenants/$TENANT/$ENV/$CONFIG_TYPE.yml" ]; then
+              echo "Using tenant-specific configuration for $ENV"
+              CONFIG_CONTENT=$(cat "tenants/$TENANT/$ENV/$CONFIG_TYPE.yml" | base64)
+            else
+              echo "Using template configuration for $ENV"
+              CONFIG_CONTENT=$(cat "template/$CONFIG_TYPE.yml" | base64)
+            fi
+            
+            echo "Creating new version for $CONFIG_TYPE configuration in $ENV..."
+            aws appconfig create-hosted-configuration-version \
+              --application-id "$APP_ID" \
+              --configuration-profile-id "$PROFILE_ID" \
+              --content "$CONFIG_CONTENT" \
+              --content-type "application/json" \
+              configuration_version_output
+          done
+        done
+      done
+  variables:
+    AWS_CREDS_TARGET_ROLE: arn:aws:iam::354116860249:role/GitLab 
+    AWS_DEFAULT_REGION: us-west-1
+
+deploy-app-config:
+  stage: deploy-app-config
+  image: 
+    name: amazon/aws-cli:latest
+    entrypoint: 
+      - '/usr/bin/env'
+  script:
+    - yum install -y jq
+    - |
+      TENANTS=$(find tenants -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+      
+      for TENANT in $TENANTS; do
+        echo "Processing tenant: $TENANT"
+        APP_ID=$(aws appconfig list-applications --query "Items[?Name=='$TENANT'].Id" --output text)
+        
+        # Process each environment
+        for ENV in dev qa; do
+          echo "Processing environment: $ENV"
+          
+          # Create/Get Environment
+          ENV_ID=$(aws appconfig list-environments --application-id "$APP_ID" --query "Items[?Name=='$ENV'].Id" --output text)
+          if [ -z "$ENV_ID" ]; then
+            echo "Creating environment '$ENV' for tenant '$TENANT'..."
+            ENV_ID=$(aws appconfig create-environment --application-id "$APP_ID" --name "$ENV" --description "Environment for $ENV" --query Id --output text)
+          fi
+          
+          # Process each configuration types
+          for CONFIG_TYPE in AllowList FeatureFlags ThrottlingLimits; do
+            echo "Processing $CONFIG_TYPE for $TENANT/$ENV"
+            
+            PROFILE_ID=$(aws appconfig list-configuration-profiles --application-id "$APP_ID" --query "Items[?Name=='$CONFIG_TYPE'].Id" --output text)
+
+            echo " Profile ID $PROFILE_ID "
+            # Get latest version for this specific profile
+            LATEST_VERSION=$(aws appconfig list-hosted-configuration-versions \
+              --application-id "$APP_ID" \
+              --configuration-profile-id "$PROFILE_ID" \
+              --query "Items[0].VersionNumber" \
+              --output text)
+            
+            # Get current deployment for this specific profile
+            CURRENT_DEPLOYMENT=$(aws appconfig list-deployments \
+            --application-id "$APP_ID" \
+            --environment-id "$ENV_ID" \
+            --query "Items[?ConfigurationName=='$CONFIG_TYPE'].ConfigurationVersion | [0]" \
+            --output text)
+
+
+            echo "Current deployment $CURRENT_DEPLOYMENT"
+              
+            CURRENT_VERSION=$(aws appconfig list-deployments \
+            --application-id "$APP_ID" \
+            --environment-id "$ENV_ID" \
+            --query "Items[?ConfigurationName=='$CONFIG_TYPE'].ConfigurationVersion | [0]" \
+            --output text)
+            
+            echo "Latest Version: $LATEST_VERSION"
+            echo "Current Version: $CURRENT_VERSION"
+            
+            if [[ "$CURRENT_DEPLOYMENT" == "None" ]] || [[ "$LATEST_VERSION" != "$CURRENT_VERSION" ]]; then
+              echo "Starting deployment for $TENANT/$ENV/$CONFIG_TYPE..."
+              DEPLOYMENT_RESPONSE=$(aws appconfig start-deployment \
+                --application-id "$APP_ID" \
+                --environment-id "$ENV_ID" \
+                --deployment-strategy-id ldbtcsb \
+                --configuration-profile-id "$PROFILE_ID" \
+                --configuration-version "$LATEST_VERSION")
+              
+              DEPLOYMENT_ID=$(echo $DEPLOYMENT_RESPONSE | jq -r '.DeploymentNumber')
+              
+              # Monitor deployment
+              max_attempts=10
+              attempt=1
+              while [ $attempt -le $max_attempts ]; do
+                echo "Checking deployment status (attempt $attempt of $max_attempts)..."
+                status=$(aws appconfig get-deployment \
+                  --application-id "$APP_ID" \
+                  --environment-id "$ENV_ID" \
+                  --deployment-number "$DEPLOYMENT_ID" \
+                  --query "State" \
+                  --output text)
+                
+                if [ "$status" = "COMPLETE" ]; then
+                  echo "Deployment completed successfully!"
+                  break
+                elif [ "$status" = "FAILED" ] || [ "$status" = "ROLLED_BACK" ]; then
+                  echo "Deployment failed or was rolled back!"
+                  exit 1
+                fi
+                
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "Deployment timed out after $max_attempts attempts"
+                  exit 1
+                fi
+                
+                attempt=$((attempt + 1))
+                sleep 30
+              done
+            else
+              echo "No changes detected for $TENANT/$ENV/$CONFIG_TYPE (Current: $CURRENT_VERSION, Latest: $LATEST_VERSION). Skipping deployment..."
+            fi
+          done
+        done
+      done
+  dependencies:
+    - update-app-config
+  variables:
+    AWS_CREDS_TARGET_ROLE: arn:aws:iam::354116860249:role/GitLab 
+    AWS_DEFAULT_REGION: us-west-1

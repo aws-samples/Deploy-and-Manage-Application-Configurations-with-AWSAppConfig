@@ -1,0 +1,15 @@
+# AllowList.yml
+
+# Network Access Controls
+ip_allowlists:
+  internal_networks:
+    - "10.0.0.0/8"     # Internal corporate network
+    - "172.16.0.0/12"  # VPC network range
+    - "192.168.1.0/24" # Development network
+
+# Domain Allowlist
+domain_allowlist:
+  api_consumers:
+    - "api.partner1.com"
+    - "services.partner2.com"
+    - "*.trusted-client.com"

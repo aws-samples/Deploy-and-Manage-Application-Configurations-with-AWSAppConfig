@@ -1,0 +1,14 @@
+# FeatureFlags.yml
+
+features:
+  new_search:
+    enabled: true
+    rollout_percentage: 76
+    description: "Enhanced search functionality"
+    
+  ai_recommendations:
+    enabled: true
+
+  chat_support:
+    enabled: false
+    description: "In-app chat support"
