@@ -58,8 +58,8 @@ update-app-config:
         done
       done
   variables:
-    AWS_CREDS_TARGET_ROLE: arn:aws:iam::354116860249:role/GitLab 
-    AWS_DEFAULT_REGION: us-west-1
+    AWS_CREDS_TARGET_ROLE: arn:aws:iam::<aws_account>:role/GitLab 
+    AWS_DEFAULT_REGION: <aws_region>
 
 deploy-app-config:
   stage: deploy-app-config
@@ -168,5 +168,5 @@ deploy-app-config:
   dependencies:
     - update-app-config
   variables:
-    AWS_CREDS_TARGET_ROLE: arn:aws:iam::354116860249:role/GitLab 
-    AWS_DEFAULT_REGION: us-west-1
+    AWS_CREDS_TARGET_ROLE: arn:aws:iam::<aws_account>:role/GitLab 
+    AWS_DEFAULT_REGION: <aws_region>
